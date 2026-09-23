@@ -1,0 +1,74 @@
+# Builds the Windows onedir package (BanKaiDownloader-windows-x64.zip).
+#
+# Why the steps look the way they do:
+# - ffmpeg.exe is downloaded here because the 139MB binary exceeds
+#   GitHub's 100MB per-file hard limit and must never be committed.
+# - icon.png is converted to .ico because PyInstaller's --icon on
+#   Windows expects an .ico file.
+# - --onedir (not --onefile): faster startup, fewer antivirus false
+#   positives; the folder is zipped for distribution.
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: # manual re-run from the Actions tab
+
+jobs:
+  exe:
+    runs-on: windows-latest # Windows Server runner, has PowerShell + bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python 3.12 matches the project's dev venv; pip cache speeds re-runs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # BtbN GPL build: full ffmpeg with mp3/aac encoders — same license
+      # arrangement as the ffmpeg.exe currently bundled in the repo folder.
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract -Force
+          $exe = Get-ChildItem ffmpeg-extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName ./ffmpeg.exe
+          Write-Host "ffmpeg ready: $($exe.FullName)"
+
+      # Pillow is already a dependency; sizes cover taskbar + file-association use
+      - name: Convert icon.png to icon.ico
+        shell: bash
+        run: |
+          python -c "from PIL import Image; im = Image.open('icon.png').convert('RGBA'); im.save('icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(256,256)])"
+          ls -la icon.ico
+
+      - name: Build with PyInstaller (onedir, windowed)
+        run: pyinstaller --onedir --windowed --icon=icon.ico --name "BanKaiDownloader" --add-binary "ffmpeg.exe;." app.py
+
+      # Zip so the artifact downloads as one file; folder inside means
+      # the user extracts once and runs BanKaiDownloader\BanKaiDownloader.exe
+      - name: Zip output
+        shell: pwsh
+        run: Compress-Archive -Path dist/BanKaiDownloader -DestinationPath BanKaiDownloader-windows-x64.zip -Force
+
+      # Available on every run under the workflow run's Artifacts section
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanKaiDownloader-windows-x64
+          path: BanKaiDownloader-windows-x64.zip
+          if-no-files-found: error
+
+      # On version tags (v1.0.0 …) also attach the zip to a GitHub Release
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BanKaiDownloader-windows-x64.zip

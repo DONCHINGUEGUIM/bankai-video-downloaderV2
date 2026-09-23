@@ -1,0 +1,14 @@
+# Build/runtime junk — never commit
+venv/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+
+# 139MB > GitHub's 100MB file hard limit — CI downloads ffmpeg instead
+ffmpeg.exe
+
+# Personal user data (history/settings live beside the app in dev runs)
+download_history.json

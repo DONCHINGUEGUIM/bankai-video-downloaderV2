@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=BanKai Downloader
+Comment=YouTube downloader with modern GUI
+Exec=@APP_DIR@/run.sh
+Icon=bankai-downloader
+Terminal=false
+Type=Application
+Categories=Video;AudioVideo;Network;
+Keywords=YouTube;Download;Video;Audio;
