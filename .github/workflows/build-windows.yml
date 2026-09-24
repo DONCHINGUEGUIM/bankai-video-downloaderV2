@@ -50,7 +50,9 @@ jobs:
           ls -la icon.ico
 
       - name: Build with PyInstaller (onedir, windowed)
-        run: pyinstaller --onedir --windowed --icon=icon.ico --name "BanKaiDownloader" --add-binary "ffmpeg.exe;." app.py
+        # --add-data icon.png so the runtime window icon (app.py loads it
+        # next to __file__) resolves inside the frozen _internal/ folder
+        run: pyinstaller --onedir --windowed --icon=icon.ico --name "BanKaiDownloader" --add-binary "ffmpeg.exe;." --add-data "icon.png;." app.py
 
       # Zip so the artifact downloads as one file; folder inside means
       # the user extracts once and runs BanKaiDownloader\BanKaiDownloader.exe

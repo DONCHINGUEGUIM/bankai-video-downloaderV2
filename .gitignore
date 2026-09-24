@@ -12,3 +12,7 @@ ffmpeg.exe
 
 # Personal user data (history/settings live beside the app in dev runs)
 download_history.json
+
+# Local test-output folders and generated icons
+Downloads/
+*.ico

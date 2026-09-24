@@ -1,6 +1,21 @@
-# BanKai Downloader (Cross-Platform)
+# BanKai Downloader
 
-YouTube downloader with a modern GUI. Works on Windows, Linux, and macOS.
+YouTube downloader with a modern GUI and multi-tab support. Works on Windows, Linux, and macOS.
+
+> **Windows CI:** every push builds `BanKaiDownloader-windows-x64.zip`
+> (onedir + bundled ffmpeg) — download it from the GitHub Actions run's
+> Artifacts section; extract and run `BanKaiDownloader\BanKaiDownloader.exe`.
+
+## Features
+
+- **Multiple tabs** — download several videos simultaneously
+- **Independent progress** — each tab tracks its own download
+- **Close tabs** — "x" to close any tab
+- **Shared history** — all downloads tracked in one history
+- **Choose save folder** — "SAVE TO" row with a Browse… picker, shared across all tabs and remembered between launches
+- Download YouTube videos in multiple qualities
+- Extract audio as MP3
+- Thumbnail preview
 
 ## Requirements
 
@@ -34,7 +49,7 @@ python3 -c "import tkinter" && echo "USE python3"
 
 **3. Create the venv and install packages (use the interpreter that passed step 2):**
 ```bash
-cd yt_downloader_gui_win
+cd yt_downloader_gui_tabs
 PY=python3                      # or PY=/usr/bin/python3.12
 $PY -m venv venv
 source venv/bin/activate
@@ -48,7 +63,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
-If the tkinter check fails on macOS, run `brew install python-tk` and rebuild the venv with the brew Python.
+If step "verify tkinter" fails on macOS, run `brew install python-tk` and rebuild the venv with the brew Python.
 
 ### Windows
 ```cmd
@@ -112,27 +127,19 @@ Output: `dist/BanKaiDownloader`
 ## How to Use
 
 1. Launch the app
-2. (Optional) Click **Browse…** in the **SAVE TO** row to pick where files go
-   — remembered between launches (default `~/Downloads`)
-3. Paste a YouTube link
-4. Click **ANALYZE**
-5. Select quality
-6. Click **Download**
+2. Click "+" to add a new tab
+3. (Optional) Click **Browse…** in the **SAVE TO** row to pick where files go
+   — shared by all tabs, remembered between launches (default `~/Downloads`)
+4. Paste a YouTube link in any tab
+5. Click **ANALYZE**
+6. Select quality
+7. Click **Download**
+8. Add more tabs for simultaneous downloads
 
 History and settings live in `~/.config/bankai_downloader/` (Linux),
 `%LOCALAPPDATA%\BanKaiDownloader\` (Windows), or
 `~/Library/Application Support/BanKaiDownloader/` (macOS) — outside the app
 folder, so reinstalls never lose your history.
-
-## Features
-
-- **Choose save folder** — "SAVE TO" row with a Browse… picker, remembered between launches
-- Download YouTube videos in multiple qualities
-- Extract audio as MP3
-- Download history with quick access
-- Thumbnail preview
-- Progress tracking
-- Cross-platform (Windows, Linux, macOS)
 
 ## Dependencies
 
@@ -159,7 +166,7 @@ ffmpeg -version
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Main GUI application |
+| `app.py` | Main GUI with tab support |
 | `downloader_engine.py` | yt-dlp wrapper (Python library) |
 | `download_tracker.py` | Download history |
 | `requirements.txt` | Python dependencies |
