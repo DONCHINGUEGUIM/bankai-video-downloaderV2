@@ -106,14 +106,53 @@ class DownloadTab(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        wrap = ctk.CTkFrame(self, fg_color="transparent")
-        # nsew: stretch with the window so preview/thumbnails get full width
+        # Scrollable host: the content (340px thumbnail + title + quality
+        # selector + Download button + progress bar) is taller than a short
+        # window (min height 620) and gets even taller under Windows display
+        # scaling — previously it was simply clipped with no way to reach the
+        # Download button. CTkScrollableFrame makes the mouse wheel work on
+        # every platform (it binds <Button-4/5>/<MouseWheel> globally — the
+        # same mechanism the History tab already uses).
+        wrap = ctk.CTkScrollableFrame(
+            self, fg_color="transparent",
+            corner_radius=0, border_width=0,
+            scrollbar_fg_color=Theme.bg,
+            scrollbar_button_color=Theme.glass,
+            scrollbar_button_hover_color=Theme.cyan
+        )
+        # nsew: stretch with the window so preview/thumbnails get full width.
+        # grid() is forwarded by CTkScrollableFrame to its outer container.
         wrap.grid(row=0, column=0, sticky="nsew", padx=48)
+        # CTkScrollableFrame does NOT forward grid_columnconfigure /
+        # grid_rowconfigure — they apply to its inner canvas frame, which is
+        # exactly where our children live. Correct as written.
         wrap.grid_columnconfigure(0, weight=1)
         # Row 0: fixed top spacer (no weight → no blank gap).
         # Row 3 (preview): takes ALL vertical slack so sticky="nsew" works.
         wrap.grid_rowconfigure(0, weight=0)
         wrap.grid_rowconfigure(3, weight=1)
+        self.wrap = wrap
+        # CTk grids its scrollbar at creation → initial state = shown
+        self._sb_shown = True
+        # Content visibility tracked in Python: Tk's winfo_reqheight() turns
+        # stale (stays at the OLD, taller value) after grid_remove() on this
+        # build — verified by measurement (734 kept after hiding 400px of
+        # content) — so the geometry sync must never read the live requested
+        # height while the content is hidden.
+        self._content_shown = False
+        # Natural height of the EMPTY state (input row + folder row + preview
+        # default), captured on the very first sync — before anything has ever
+        # been shown/hidden, so the value is guaranteed fresh. It is
+        # width-independent (no wrapping/thumbnail inside the empty preview),
+        # so caching it once is safe for the tab's whole lifetime.
+        self._empty_req = None
+        # Window resized → re-decide stretch vs. scroll (see the sync method).
+        # add="+" is ESSENTIAL: a plain bind() REPLACES CTk's own <Configure>
+        # handler that syncs the inner frame's width to the canvas — without
+        # it the content squeezes down to its requested width (290px) inside
+        # a full-width canvas.
+        wrap._parent_canvas.bind("<Configure>", self._sync_scroll_geometry,
+                                 add="+")
 
         # ── Input line ──────────────────────────────────────────
         line = ctk.CTkFrame(wrap, fg_color=Theme.surface, corner_radius=14, border_width=0)
@@ -276,6 +315,63 @@ class DownloadTab(ctk.CTkFrame):
 
         self.url_input.bind("<Return>", lambda e: self._analyze())
 
+    # ─── Scroll geometry (stretch when it fits, scroll when tall) ─
+
+    def _sync_scroll_geometry(self, event=None):
+        """Size the scroll host's inner frame to max(content, visible area).
+
+        CTk's vertical CTkScrollableFrame only syncs the inner frame's WIDTH
+        to its canvas (see its _fit_frame_dimensions_to_canvas), so by default
+        the inner frame keeps its *requested* height. That means:
+          - short window: content overflows and must become scrollable;
+          - tall window: content must STRETCH (the preview panel has to fill
+            the tab, like the old non-scrolling layout).
+
+        We therefore force:  inner_height = max(requested, canvas_height)
+          - content taller than the window -> the canvas scrollregion grows ->
+            the mouse wheel scrolls the tab (button/progress always reachable);
+          - content shorter -> the inner frame fills the canvas, grid row 3
+            (preview) absorbs the slack -> identical look to before.
+
+        Also hides the scrollbar while everything fits — same idea as the
+        tab strip's _sync_tab_scrollbar.
+        """
+        canvas = self.wrap._parent_canvas
+        if canvas.winfo_height() <= 1:
+            return  # window not realised yet — Configure fires again later
+        self.update_idletasks()            # ensure requested sizes are fresh
+        # Natural height of the content — shrink-proof (see _content_shown):
+        #   visible → live value: gridding content back in and resizing its
+        #             children both refresh winfo_reqheight() correctly
+        #             (measured 328 → 734 when the content appeared);
+        #   hidden  → the cached empty height: reading the live value here
+        #             would return the STALE pre-hide height (~734) and keep
+        #             a phantom scrollbar + dead scroll space on an empty tab.
+        if self._content_shown:
+            req = self.wrap.winfo_reqheight()
+        else:
+            if self._empty_req is None:  # first pass, still pristine
+                self._empty_req = self.wrap.winfo_reqheight()
+            req = self._empty_req
+        avail = canvas.winfo_height()      # height of the visible area
+        canvas.itemconfigure(self.wrap._create_window_id,
+                             height=max(req, avail))
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=bbox)
+        # Toggle the scrollbar ONLY on state change — re-gridding inside a
+        # <Configure> handler would resize the canvas and loop forever.
+        # State is tracked in a flag rather than winfo_ismapped()/grid_info()
+        # because Tk processes map/unmap asynchronously: those queries are
+        # stale within the same call stack and would flip the bar every pass.
+        overflow = req > avail + 1
+        if overflow and not self._sb_shown:
+            self.wrap._scrollbar.grid()        # restore CTk's own grid options
+            self._sb_shown = True
+        elif not overflow and self._sb_shown:
+            self.wrap._scrollbar.grid_remove() # fits → no bar needed
+            self._sb_shown = False
+
     # ─── UI helpers ──────────────────────────────────────────────
 
     def _apply_resize(self):
@@ -289,6 +385,9 @@ class DownloadTab(ctk.CTkFrame):
             return
         self.v_title.configure(wraplength=max(300, w - 220))
         self._refit_thumb()
+        # Title/thumbnail sizes changed → content height changed → re-decide
+        # stretch vs. scroll (cheap no-op when nothing moved).
+        self._sync_scroll_geometry()
 
     def _refit_thumb(self):
         """Scale the stored PIL thumbnail into the available content box.
@@ -313,6 +412,8 @@ class DownloadTab(ctk.CTkFrame):
             size=(img.width, img.height)
         )
         self.thumb.configure(image=self._thumb, width=box_w, height=box_h)
+        # Thumbnail height changed → refresh scrollregion / stretch decision
+        self._sync_scroll_geometry()
 
     def _set_folder_label(self, path):
         """Refresh this tab's 'save to' label after the shared folder changes."""
@@ -330,19 +431,44 @@ class DownloadTab(ctk.CTkFrame):
     def _show_content(self):
         self.empty.place_forget()
         self.content.grid()
+        self._content_shown = True  # from here on the sync reads live heights
+        self._sync_scroll_geometry()  # content appeared → maybe now scrollable
 
     def _hide_content(self):
         self.content.grid_remove()
+        # Flag BEFORE the sync: winfo_reqheight() is already stale-high the
+        # moment the content leaves the grid, so the sync must use the cache.
+        self._content_shown = False
         self.empty.place(relx=0.5, rely=0.4, anchor="center")
+        self._sync_scroll_geometry()  # content gone → back to stretched layout
 
     def _show_progress(self):
         self.prog_frame.grid()
         self.prog_txt.grid()
+        self._sync_scroll_geometry()  # progress row added at the bottom
 
     def _hide_progress(self):
         self.prog_frame.grid_remove()
         self.prog_txt.grid_remove()
         self.prog.set(0)
+        # Best-effort refresh: removing grid children can leave the parents'
+        # winfo_reqheight() stale-HIGH (the ~72px the progress rows occupied),
+        # which would keep a strip of dead scroll space under the content.
+        # A configure-driven size change DOES travel up the chain
+        # (content → preview → wrap), so briefly rewrapping the title to
+        # 1px forces Tk to recompute the requested heights bottom-up — first
+        # with the fat title, then again with the restored wraplength, i.e.
+        # with the progress rows already gone. Harmless if the chain had
+        # already refreshed itself; cget() hands back the exact raw value
+        # (scaling is re-applied internally), so the restore cannot drift.
+        if self._content_shown:
+            wl = self.v_title.cget("wraplength")
+            if wl:
+                self.v_title.configure(wraplength=1)
+                self.update_idletasks()
+                self.v_title.configure(wraplength=wl)
+                self.update_idletasks()
+        self._sync_scroll_geometry()  # progress row removed
 
     def _idle(self):
         self.btn_go.configure(state="normal", text="\u2192")
