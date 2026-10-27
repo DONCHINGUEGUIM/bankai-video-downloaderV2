@@ -1,6 +1,7 @@
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import messagebox, filedialog
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 import threading
 import requests
 from io import BytesIO
@@ -30,10 +31,121 @@ def _thread(fn):
     threading.Thread(target=fn, daemon=True).start()
 
 
+# ─── Right-click edit menu ───────────────────────────────────────
+def _attach_context_menu(ctk_entry):
+    """Give a CTkEntry a working right-click Cut / Copy / Paste menu.
+
+    Tk ships no context menu of its own: a right click in an Entry does
+    nothing on Windows and only moves the caret on X11, so users who expect
+    right-click-paste get silence. We build one tk.Menu and pop it up at the
+    pointer.
+
+    CTkEntry is a frame wrapping a real tkinter.Entry (._entry) — the menu
+    must drive that inner widget, which is where the click is bound.
+    """
+    inner = getattr(ctk_entry, "_entry", ctk_entry)
+
+    # Same palette as the rest of the UI — Tk's default menu is light grey
+    # and looks pasted-on over the dark window.
+    menu = tk.Menu(
+        ctk_entry, tearoff=0,
+        bg=Theme.surface, fg=Theme.text,
+        activebackground=Theme.cyan, activeforeground="#000000",
+        bd=0, relief="flat", activeborderwidth=0,
+    )
+    # Actions talk to the clipboard directly instead of relying on Tk's
+    # <<Cut>> / <<Copy>> / <<Paste>> virtual events — those silently do
+    # nothing when the widget isn't the focus owner, which is exactly the
+    # state a right-click leaves the field in.
+    def _placeholder_active():
+        # CTkEntry fakes its placeholder by putting REAL text in the Entry
+        # and flagging it — every action below has to ignore that text.
+        return getattr(ctk_entry, "_placeholder_text_active", False)
+
+    def _selected():
+        if _placeholder_active():
+            return ""  # visible text is only the placeholder
+        try:
+            return inner.selection_get()
+        except Exception:
+            return ""  # nothing selected
+
+    def do_cut():
+        text = _selected()
+        if text:
+            ctk_entry.clipboard_clear()
+            ctk_entry.clipboard_append(text)
+            inner.delete("sel.first", "sel.last")
+
+    def do_copy():
+        text = _selected()
+        if text:
+            ctk_entry.clipboard_clear()
+            ctk_entry.clipboard_append(text)
+
+    def do_paste():
+        try:
+            text = ctk_entry.clipboard_get()
+        except Exception:
+            return  # empty clipboard → nothing to paste
+        if _placeholder_active():
+            # Clearing via CTkEntry also unsets its flag; writing straight to
+            # the inner Entry would leave get() returning "".
+            ctk_entry._deactivate_placeholder()
+        elif inner.selection_present():
+            # Pasting over a selection replaces it, like every other editor
+            inner.delete("sel.first", "sel.last")
+        inner.insert("insert", text)
+
+    def do_select_all():
+        if _placeholder_active():
+            return  # nothing real to select
+        inner.selection_range(0, "end")
+        inner.icursor("end")
+
+    menu.add_command(label="Cut", command=do_cut)
+    menu.add_command(label="Copy", command=do_copy)
+    menu.add_command(label="Paste", command=do_paste)
+    menu.add_separator()
+    menu.add_command(label="Select All", command=do_select_all)
+
+    def popup(event):
+        inner.focus_set()  # paste must land here, not in the previous focus
+        # tk_popup() posts the menu AND installs the grab that makes it
+        # modal — item clicks and dismiss-on-outside-click both depend on
+        # it. Releasing that grab right after the call (the widely
+        # copy-pasted try/finally idiom) breaks exactly those two things:
+        # the menu stays open and clicking an item does nothing.
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    # CTkEntry.bind() forwards to the inner Entry, so binding the inner
+    # widget alone covers both — binding both would pop the menu twice.
+    # Bind the RELEASE, not the press. Opening on <Button-3> means the
+    # button-release that always follows lands on the freshly posted menu,
+    # and Tk reads that as a click outside → the menu closes instantly.
+    # That is why the menu only survived while the button stayed held.
+    inner.bind("<ButtonRelease-3>", popup)          # Windows / X11 right-click
+    inner.bind("<ButtonRelease-2>", popup)          # X11 middle-click habit
+    inner.bind("<Control-ButtonRelease-1>", popup)  # macOS right-click
+    # Keep a reference on the widget: a menu owned only by these closures
+    # can be garbage-collected while it is posted.
+    ctk_entry._context_menu = menu
+    return menu
+
+
 # ─── Settings (shared download folder, persisted across launches) ─
 # Stored next to download_history.json so all app data lives in one place.
 SETTINGS_FILE = os.path.join(HISTORY_DIR, "settings.json")
 DEFAULT_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+# ─── Credits (footer line at the bottom of the window) ───────────
+# Kept as constants so rebranding is a one-line change — the footer label
+# is built from these in App._build().
+APP_AUTHOR = "Herun"
+APP_YEAR = "2026"
+APP_CREDIT = f"Made by {APP_AUTHOR}  ·  © {APP_YEAR} {APP_AUTHOR}. All rights reserved."
 
 
 def _load_download_folder():
@@ -87,6 +199,29 @@ class Theme:
     muted = "#5C5C80"
     glass = "#141428"
     title_bg = "#08081A"
+
+
+# ─── Paste icon (drawn, so it renders on every platform) ─────────
+def _clipboard_icon(size=20, color=None):
+    """Draw a small clipboard glyph for the PASTE button.
+
+    Drawn with PIL instead of the 📋 emoji: Tk does no font fallback on
+    Linux, so emoji come out as tofu boxes there while they work on Windows.
+    A drawn image looks the same everywhere and takes its colour from the
+    theme.
+    """
+    color = color or Theme.text
+    rgb = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))  # "#RRGGBB" → RGB
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    # Board, clip on the top edge, then two text lines inside
+    d.rounded_rectangle([2, 4, size - 3, size - 2], radius=2, outline=rgb, width=2)
+    d.rounded_rectangle([size // 2 - 4, 1, size // 2 + 4, 6], radius=1,
+                        outline=rgb, width=2)
+    d.line([5, 11, size - 6, 11], fill=rgb, width=2)
+    d.line([5, 15, size - 8, 15], fill=rgb, width=2)
+    return img
+
 
 ctk.set_appearance_mode("Dark")
 
@@ -170,6 +305,21 @@ class DownloadTab(ctk.CTkFrame):
             font=ctk.CTkFont(size=16), text_color=Theme.text
         )
         self.url_input.grid(row=0, column=0, padx=(18, 8), pady=10, sticky="ew")
+        # Right-click menu on the link field (Cut / Copy / Paste / Select All)
+        _attach_context_menu(self.url_input)
+
+        # PASTE — icon-only button between the field and ANALYZE. The CTkImage
+        # is kept on self so the bitmap can't be dropped after layout.
+        self._paste_img = ctk.CTkImage(
+            light_image=_clipboard_icon(), dark_image=_clipboard_icon(),
+            size=(20, 20)
+        )
+        self.btn_paste = ctk.CTkButton(
+            inp, text="", image=self._paste_img, width=52, height=42,
+            fg_color=Theme.glass, hover_color=Theme.purple,
+            corner_radius=10, command=self._paste_url
+        )
+        self.btn_paste.grid(row=0, column=1, padx=(0, 6), pady=6)
 
         self.btn_go = ctk.CTkButton(
             inp, text="ANALYZE", width=110, height=42,
@@ -178,7 +328,7 @@ class DownloadTab(ctk.CTkFrame):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._analyze
         )
-        self.btn_go.grid(row=0, column=1, padx=(0, 6), pady=6)
+        self.btn_go.grid(row=0, column=2, padx=(0, 6), pady=6)
 
         # ── Folder chooser row (shared across all tabs) ─────────
         frow = ctk.CTkFrame(wrap, fg_color=Theme.surface, corner_radius=14, border_width=0)
@@ -477,6 +627,21 @@ class DownloadTab(ctk.CTkFrame):
 
     # ─── Analysis ────────────────────────────────────────────────
 
+    def _paste_url(self):
+        """Fill the link field from the clipboard.
+
+        A paste into a single-URL field means "use this link", so any
+        existing text is replaced rather than appended — otherwise clicking
+        PASTE twice would leave two links glued together.
+        """
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            return  # Tk raises TclError when the clipboard is empty
+        self.url_input.delete(0, "end")
+        self.url_input.insert(0, text.strip())
+        self.url_input.focus_set()
+
     def _analyze(self):
         url = self.url_input.get().strip()
         if not url:
@@ -757,6 +922,8 @@ class App(ctk.CTk):
         self._overlay = None  # active full-window "done" overlay (if any)
 
         self._build()
+        # Open one tab on launch so the app never starts on an empty view
+        self._add_tab()
         self._bind_tab_strip_wheel()
         # Debounced window resize → tab layouts re-fit (thumb, wraplength)
         self.bind("<Configure>", self._on_window_configure)
@@ -1025,6 +1192,15 @@ class App(ctk.CTk):
         self.history_view = HistoryView(self.content_frame, self.tracker)
         self.history_view.grid(row=0, column=0, sticky="nsew")
         self.history_view.grid_remove()
+
+        # ─── Footer: author credit / copyright ──────────────────
+        # Row 2 is left at weight=0, so the footer keeps its natural height
+        # and only the content area (row 1) stretches on window resize.
+        ctk.CTkLabel(
+            self, text=APP_CREDIT,
+            height=26, fg_color=Theme.title_bg, corner_radius=0,
+            font=ctk.CTkFont(size=10), text_color=Theme.muted,
+        ).grid(row=2, column=0, sticky="ew")
 
     # ─── Shared download folder ──────────────────────────────────
 

@@ -16,3 +16,7 @@ download_history.json
 # Local test-output folders and generated icons
 Downloads/
 *.ico
+
+# CI artifacts pulled down with `gh run download` — big zips, never commit
+dist-download/
+*.zip
