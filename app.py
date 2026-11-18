@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import subprocess
-from downloader_engine import DownloaderEngine
+from downloader_engine import DownloaderEngine, _lang_name
 from download_tracker import DownloadTracker, HISTORY_DIR
 
 
@@ -147,6 +147,17 @@ APP_AUTHOR = "Herun"
 APP_YEAR = "2026"
 APP_CREDIT = f"Made by {APP_AUTHOR}  ·  © {APP_YEAR} {APP_AUTHOR}. All rights reserved."
 
+# Quality buckets offered on a playlist card. Per-video sizes would require
+# resolving every entry's formats up front, so playlists trade that detail
+# for a fast analysis.
+PLAYLIST_QUALITIES = ["Best available", "1080p", "720p", "480p", "Audio Only (MP3)"]
+
+# Languages offered on a playlist card. A flat playlist analysis carries no
+# caption metadata, so the list cannot be discovered per video — these are
+# simply the ones people ask for; yt-dlp skips videos that lack them.
+COMMON_SUBTITLE_LANGS = ("en", "fr", "es", "pt", "de", "ar", "hi",
+                         "zh-Hans", "ru", "ja", "ko", "it")
+
 
 def _load_download_folder():
     """Read the saved download folder; fall back to ~/Downloads."""
@@ -223,6 +234,40 @@ def _clipboard_icon(size=20, color=None):
     return img
 
 
+def _erase_icon(size=20, color=None):
+    """Draw a small ✕ glyph for the CLEAR button.
+
+    Same reason as the clipboard icon: Tk does no font fallback on Linux, so
+    an emoji or a "✕" character renders as a tofu box there while working on
+    Windows. A drawn image looks identical on every platform and follows the
+    theme colour.
+    """
+    color = color or Theme.text
+    rgb = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))  # "#RRGGBB" → RGB
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pad = 5
+    # Two diagonals; dots at the ends fake round line caps (PIL has none)
+    d.line([pad, pad, size - pad, size - pad], fill=rgb, width=2)
+    d.line([size - pad, pad, pad, size - pad], fill=rgb, width=2)
+    for x, y in ((pad, pad), (size - pad, pad),
+                 (pad, size - pad), (size - pad, size - pad)):
+        d.ellipse([x - 1, y - 1, x + 1, y + 1], fill=rgb)
+    return img
+
+
+def _fmt_size(nbytes):
+    """Human-readable size for a byte count; 0/None means "unknown"."""
+    if not nbytes:
+        return "?"
+    mb = nbytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    if mb >= 10:
+        return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB"
+
+
 ctk.set_appearance_mode("Dark")
 
 
@@ -235,6 +280,14 @@ class DownloadTab(ctk.CTkFrame):
         self.app = app
         self.info = None
         self.current_url = ""
+        self.is_playlist = False   # card currently shows a playlist
+        self.playlist_count = 0    # videos behind the current link
+        self.playlist_selection = None  # set of ticks from the selector
+        self._entries = None  # cached playlist entries (None = not loaded yet)
+        self._size_cache = {}  # (url, format) -> bytes, filled by the picker
+        self._size_token = None  # abandons a superseded size probe
+        self._sub_map = {"None": None}  # subtitle menu label -> language code
+        self._cancel_evt = threading.Event()  # set by the Cancel button
         self._thumb = None   # CTkImage currently shown (keeps PIL alive for GC)
         self._pil_thumb = None  # original PIL image, kept for re-fits on resize
 
@@ -308,6 +361,19 @@ class DownloadTab(ctk.CTkFrame):
         # Right-click menu on the link field (Cut / Copy / Paste / Select All)
         _attach_context_menu(self.url_input)
 
+        # CLEAR — wipes the link field and returns the card to its empty
+        # state. Sits right against the field, where an "x" is expected.
+        self._clear_img = ctk.CTkImage(
+            light_image=_erase_icon(), dark_image=_erase_icon(),
+            size=(20, 20)
+        )
+        self.btn_clear = ctk.CTkButton(
+            inp, text="", image=self._clear_img, width=44, height=42,
+            fg_color="transparent", hover_color=Theme.pink,
+            corner_radius=10, command=self._clear_url
+        )
+        self.btn_clear.grid(row=0, column=1, padx=(0, 6), pady=6)
+
         # PASTE — icon-only button between the field and ANALYZE. The CTkImage
         # is kept on self so the bitmap can't be dropped after layout.
         self._paste_img = ctk.CTkImage(
@@ -319,7 +385,7 @@ class DownloadTab(ctk.CTkFrame):
             fg_color=Theme.glass, hover_color=Theme.purple,
             corner_radius=10, command=self._paste_url
         )
-        self.btn_paste.grid(row=0, column=1, padx=(0, 6), pady=6)
+        self.btn_paste.grid(row=0, column=2, padx=(0, 6), pady=6)
 
         self.btn_go = ctk.CTkButton(
             inp, text="ANALYZE", width=110, height=42,
@@ -328,7 +394,7 @@ class DownloadTab(ctk.CTkFrame):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._analyze
         )
-        self.btn_go.grid(row=0, column=2, padx=(0, 6), pady=6)
+        self.btn_go.grid(row=0, column=3, padx=(0, 6), pady=6)
 
         # ── Folder chooser row (shared across all tabs) ─────────
         frow = ctk.CTkFrame(wrap, fg_color=Theme.surface, corner_radius=14, border_width=0)
@@ -426,7 +492,8 @@ class DownloadTab(ctk.CTkFrame):
             dropdown_fg_color=Theme.card,
             dropdown_hover_color=Theme.glass,
             text_color=Theme.text, corner_radius=8,
-            font=ctk.CTkFont(size=12)
+            font=ctk.CTkFont(size=12),
+            command=self._on_quality_pick
         )
         self.q_menu.grid(row=0, column=0, sticky="w")
 
@@ -438,6 +505,77 @@ class DownloadTab(ctk.CTkFrame):
             command=self._download
         )
         self.btn_dl.grid(row=0, column=1, padx=(12, 0))
+
+        # Playlist only: opens the checkbox list so the user can pick which
+        # videos to fetch instead of taking the whole list
+        self.btn_select = ctk.CTkButton(
+            sel_row, text="Select…", width=90, height=36,
+            fg_color=Theme.glass, hover_color=Theme.cyan,
+            text_color=Theme.text, corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._open_selector
+        )
+        self.btn_select.grid(row=0, column=2, padx=(8, 0))
+        self.btn_select.grid_remove()
+
+        # Cancel — only while something is running (see _start_download)
+        self.btn_cancel = ctk.CTkButton(
+            sel_row, text="Cancel", width=90, height=36,
+            fg_color="transparent", hover_color=Theme.pink,
+            text_color=Theme.muted, corner_radius=8,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._cancel_download
+        )
+        self.btn_cancel.grid(row=0, column=3, padx=(8, 0))
+        self.btn_cancel.grid_remove()
+
+        # Opt-in for watch?v=…&list=… links. Unchecked — the default — keeps
+        # today's "just this video" behaviour; hidden unless the link really
+        # sits inside a playlist.
+        self.chk_playlist = ctk.CTkCheckBox(
+            act, text="Download the whole playlist instead",
+            font=ctk.CTkFont(size=11), text_color=Theme.muted,
+            fg_color=Theme.cyan, hover_color=Theme.purple,
+            border_width=1, border_color=Theme.border,
+            checkbox_width=16, checkbox_height=16, corner_radius=4,
+            command=self._on_playlist_toggle
+        )
+        self.chk_playlist.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.chk_playlist.grid_remove()
+
+        # ── Subtitles row ───────────────────────────────────────
+        # A video card lists the captions that video really has; a playlist
+        # card offers the common languages plus "All available", because a
+        # flat playlist analysis carries no caption metadata at all.
+        sub_row = ctk.CTkFrame(act, fg_color="transparent")
+        sub_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        sub_row.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            sub_row, text="Subtitles",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=Theme.muted
+        ).grid(row=0, column=0, sticky="w")
+
+        self.sub_menu = ctk.CTkOptionMenu(
+            sub_row, values=["None"], width=220, height=32,
+            fg_color=Theme.glass, button_color=Theme.cyan,
+            button_hover_color=Theme.purple,
+            dropdown_fg_color=Theme.card,
+            dropdown_hover_color=Theme.glass,
+            text_color=Theme.text, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            command=self._on_subtitle_pick
+        )
+        self.sub_menu.grid(row=0, column=1, padx=(12, 0), sticky="w")
+        self.sub_menu.configure(state="disabled")
+
+        # Says what the choice actually does to the downloaded file
+        self.sub_hint = ctk.CTkLabel(
+            sub_row, text="",
+            font=ctk.CTkFont(size=9), text_color=Theme.muted, anchor="w"
+        )
+        self.sub_hint.grid(row=0, column=2, padx=(12, 0), sticky="w")
 
         # Progress bar
         self.prog_frame = ctk.CTkFrame(self.content, fg_color="transparent", height=4)
@@ -620,10 +758,32 @@ class DownloadTab(ctk.CTkFrame):
                 self.update_idletasks()
         self._sync_scroll_geometry()  # progress row removed
 
+    def _playlist_mode(self):
+        """True when the next Download click should fetch a whole playlist."""
+        return self.is_playlist or bool(self.chk_playlist.get())
+
     def _idle(self):
         self.btn_go.configure(state="normal", text="\u2192")
-        self.btn_dl.configure(state="normal", text="Download")
+        self.btn_dl.configure(state="normal", text=self._scope_label())
+        self.btn_select.configure(state="normal")
+        self.chk_playlist.configure(state="normal")
+        # Only re-enable the caption menu when the card actually has choices
+        self.sub_menu.configure(state="normal" if len(self._sub_map) > 1
+                                else "disabled")
+        self.btn_cancel.grid_remove()
         self._hide_progress()
+
+    def _scope_label(self):
+        """Download-button text for the current scope.
+
+        "Download all N" when the whole list is in play, "Download N selected"
+        once the picker narrowed it down, plain "Download" for a single video.
+        """
+        if self.playlist_selection is not None:
+            return f"Download {len(self.playlist_selection)} selected"
+        if self._playlist_mode():
+            return f"Download all {self.playlist_count}"
+        return "Download"
 
     # ─── Analysis ────────────────────────────────────────────────
 
@@ -640,13 +800,49 @@ class DownloadTab(ctk.CTkFrame):
             return  # Tk raises TclError when the clipboard is empty
         self.url_input.delete(0, "end")
         self.url_input.insert(0, text.strip())
-        self.url_input.focus_set()
+        self.url_input.focus()
+
+    def _clear_url(self):
+        """Wipe the link field and put the card back in its empty state.
+
+        CTkEntry stores its placeholder as real text, so delete() is safe
+        either way: if the placeholder is showing, the widget immediately
+        puts it back (the entry is not focused at that point).
+        """
+        self.url_input.delete(0, "end")
+
+        # A running download owns the card — wipe the text, leave the job be
+        if self.btn_cancel.grid_info():
+            self.url_input.focus()
+            return
+
+        # Forget everything the cleared link produced, so a stale card can't
+        # be downloaded by accident after the field is empty.
+        self.current_url = ""
+        self.info = None
+        self.is_playlist = False
+        self.playlist_count = 0
+        self.playlist_selection = None
+        self._entries = None
+        self._size_token = None  # stop any size probe still running
+        self.chk_playlist.deselect()
+        self.chk_playlist.grid_remove()
+        self.btn_select.grid_remove()
+        self.q_menu.set("Select")
+        self._set_subtitle_menu([])  # nothing analysed → no caption choices
+        self._hide_content()
+        self._idle()
+        self.url_input.focus()
 
     def _analyze(self):
         url = self.url_input.get().strip()
         if not url:
             return
         self.current_url = url
+        # A new link invalidates the previous playlist's cached entries
+        self._entries = None
+        self.playlist_selection = None
+        self._size_token = None  # abandon any size probe for the old link
         self.btn_go.configure(state="disabled", text="...")
         self._hide_content()
         self._hide_progress()
@@ -663,6 +859,14 @@ class DownloadTab(ctk.CTkFrame):
             return
 
         self.info = info
+
+        # Playlist link → its own card. Nothing downloads until the user
+        # clicks "Download all", so analysis stays harmless.
+        if info.get("type") == "playlist":
+            self._show_playlist_info(info)
+            return
+
+        self.is_playlist = False
         self._show_content()
 
         self.v_title.configure(text=info.get("title", "?"))
@@ -677,6 +881,10 @@ class DownloadTab(ctk.CTkFrame):
             self.q_menu.configure(values=fmts)
             self.q_menu.set(fmts[0])
 
+        self._sync_playlist_checkbox(info)
+        # Caption languages this video really offers (manual + auto)
+        self._set_subtitle_menu(info.get("subtitle_langs") or [])
+
         thumb = info.get("thumbnail")
         if thumb:
             _thread(lambda: self._load_thumb(thumb))
@@ -684,6 +892,440 @@ class DownloadTab(ctk.CTkFrame):
         # Title/wrap depend on the now-realised content — re-fit immediately
         self._apply_resize()
         self._idle()
+
+    # ─── Playlists ───────────────────────────────────────────────
+
+    def _show_playlist_info(self, info):
+        """Render a playlist card: title, video count, fixed quality buckets."""
+        self.is_playlist = True
+        self.playlist_count = int(info.get("count") or 0)
+        # New link → no subset chosen yet, so the button means "the whole list"
+        self.playlist_selection = None
+        # The entries came with the analysis — keep them so the picker opens
+        # instantly instead of re-reading the playlist
+        self._entries = list(info.get("entries") or [])
+        # The playlist card is already the opt-in — the checkbox has no job
+        self.chk_playlist.deselect()
+        self.chk_playlist.grid_remove()
+        # A playlist is the only place a picker makes sense
+        self.btn_select.grid()
+        # Captions differ per video here, so offer the common set
+        self._set_playlist_subtitles()
+
+        self._show_content()
+        self.v_title.configure(text=info.get("title", "Playlist"))
+        self.v_meta.configure(
+            text=f"PLAYLIST  \u2022  {self.playlist_count} videos")
+
+        # Sizes are unknown without resolving every entry, so offer heights
+        self.q_menu.configure(values=PLAYLIST_QUALITIES)
+        self.q_menu.set(PLAYLIST_QUALITIES[0])
+
+        thumb = info.get("thumbnail")
+        if thumb:
+            _thread(lambda: self._load_thumb(thumb))
+
+        self._apply_resize()
+        self._idle()
+
+    def _sync_playlist_checkbox(self, info):
+        """Show the opt-in checkbox only for watch?v=…&list=… links."""
+        count = int(info.get("playlist_count") or 0)
+        self.chk_playlist.deselect()
+        # Single-video card: no picker, and any old subset is meaningless now
+        self.playlist_selection = None
+        self._entries = None
+        self.btn_select.grid_remove()
+        if count > 1:
+            self.playlist_count = count
+            self.chk_playlist.configure(
+                text=f"Download the whole playlist instead ({count} videos)")
+            self.chk_playlist.grid()
+        else:
+            self.playlist_count = 0
+            self.chk_playlist.grid_remove()
+
+    def _on_playlist_toggle(self):
+        """Checkbox flipped → scope changes, so does the picker's availability.
+
+        Ticking the box turns the card into "the whole playlist", which is
+        exactly when a video subset becomes worth choosing — so Select…
+        appears with it and disappears when it is unticked.
+        """
+        if self.chk_playlist.get():
+            self.playlist_selection = None
+            self._entries = None  # not read yet — the picker loads them
+            self.btn_select.grid()
+            # Whole-list mode → captions are no longer this video's alone
+            self._set_playlist_subtitles()
+        else:
+            # Back to "just this video": a playlist subset no longer applies
+            self.playlist_selection = None
+            self._entries = None
+            self.btn_select.grid_remove()
+            self._set_subtitle_menu(
+                (self.info or {}).get("subtitle_langs") or [])
+        self.btn_dl.configure(text=self._scope_label())
+
+    # ─── Subtitles ───────────────────────────────────────────────
+
+    def _set_subtitle_menu(self, langs):
+        """Fill the SUBTITLES menu with the captions a video actually has.
+
+        "None" is always first, so the default stays "no subtitles" and
+        nothing changes for anyone who never touches this. Auto-generated
+        tracks are labelled, because YouTube's speech recognition is a very
+        different product from a hand-written subtitle.
+        """
+        self._sub_map = {"None": None}
+        values = ["None"]
+        for lang in langs:
+            # "English (en)", but "Chinese (Simplified) · zh-Hans" — a name
+            # that already carries a qualifier does not get a second bracket.
+            if lang["name"].endswith(")"):
+                label = f"{lang['name']} \u00b7 {lang['code']}"
+            else:
+                label = f"{lang['name']} ({lang['code']})"
+            if lang.get("auto"):
+                label += "  \u2013 auto"
+            self._sub_map[label] = lang["code"]
+            values.append(label)
+        if langs:
+            self._sub_map["All available"] = "all"
+            values.append("All available")
+        self.sub_menu.configure(values=values,
+                                state="normal" if langs else "disabled")
+        self.sub_menu.set("None")
+        self._on_subtitle_pick()
+
+    def _set_playlist_subtitles(self):
+        """Common languages + "All available" for playlist downloads.
+
+        A flat playlist analysis carries no caption metadata, so nothing can
+        be listed per video; yt-dlp simply skips the entries that do not have
+        the chosen language.
+        """
+        self._set_subtitle_menu([
+            {"code": code, "name": _lang_name(code), "auto": False}
+            for code in COMMON_SUBTITLE_LANGS
+        ])
+
+    def _chosen_subs(self):
+        """Caption codes for the next download ([] = none)."""
+        code = self._sub_map.get(self.sub_menu.get())
+        return [code] if code else []
+
+    def _on_subtitle_pick(self, _value=None):
+        """Selection changed → update the hint that explains the result."""
+        self.sub_hint.configure(text=self._subtitle_hint())
+
+    def _on_quality_pick(self, _value=None):
+        """Quality changed → MP3 changes what subtitles can do."""
+        self._on_subtitle_pick()
+
+    def _subtitle_hint(self):
+        """One line saying where the subtitles end up."""
+        if not self._chosen_subs():
+            return ""
+        if self.q_menu.get() == "Audio Only (MP3)":
+            return ".srt files next to the MP3"
+        return "embedded in the video + .srt kept"
+
+    # ─── Playlist selector ───────────────────────────────────────
+
+    def _playlist_url(self):
+        """URL that expands to the playlist behind the current card.
+
+        A playlist card already holds one; a video card only carries the list
+        id inside its watch link, so rebuild the canonical playlist URL.
+        """
+        if self.is_playlist:
+            return self.current_url
+        m = re.search(r"[?&]list=([^&]+)", self.current_url or "")
+        if not m:
+            return ""
+        return f"https://www.youtube.com/playlist?list={m.group(1)}"
+
+    def _open_selector(self):
+        """Open the picker that chooses which playlist videos to fetch.
+
+        A playlist analysis already brings the entries along. A
+        watch?v=…&list=… card only knows the list id, so those are read on
+        demand behind a small "reading playlist…" card — the fetch runs on a
+        worker thread so the window never freezes.
+        """
+        if self._entries:
+            self.app._show_overlay(
+                lambda parent: self._build_selector(parent, self._entries))
+            return
+
+        url = self._playlist_url()
+        if not url:
+            return
+        self.app._show_overlay(self._build_loading)
+        _thread(lambda: self._load_entries(url))
+
+    def _load_entries(self, url):
+        """Worker: read the playlist's flat entry list (no formats resolved)."""
+        info = self.engine.get_info(url)
+        self.after(0, lambda: self._on_entries(info))
+
+    def _on_entries(self, info):
+        """Entry list arrived (or failed) → swap the loading card for it."""
+        entries = info.get("entries") or []
+        if not entries:
+            self.app._close_overlay()
+            messagebox.showerror(
+                "Error", info.get("error") or "Could not read this playlist.")
+            return
+        self._entries = entries
+        self.playlist_count = len(entries)
+        # The card's count can differ from reality (private/deleted entries)
+        self.btn_dl.configure(text=self._scope_label())
+        self.app._show_overlay(
+            lambda parent: self._build_selector(parent, entries))
+
+    def _build_loading(self, parent):
+        """Placeholder card shown while the entry list is being fetched."""
+        card = ctk.CTkFrame(parent, fg_color=Theme.surface, corner_radius=14,
+                            border_width=1, border_color=Theme.border)
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkFrame(card, height=3, fg_color=Theme.cyan, corner_radius=0,
+                     border_width=0).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            card, text="Reading playlist\u2026",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=Theme.text
+        ).grid(row=1, column=0, padx=40, pady=(22, 6))
+
+        ctk.CTkLabel(
+            card, text="fetching the video list",
+            font=ctk.CTkFont(size=10), text_color=Theme.muted
+        ).grid(row=2, column=0, padx=40, pady=(0, 22))
+
+        return card
+
+    def _build_selector(self, parent, entries):
+        """Checkbox list of the playlist's entries, inside the app overlay.
+
+        Ticks are playlist positions (1-based), which is exactly what
+        download_playlist(only=…) filters on. Ticking everything collapses
+        back to None so the plain "whole list" path runs unchanged.
+        """
+        total = len(entries)
+
+        card = ctk.CTkFrame(parent, fg_color=Theme.surface, corner_radius=14,
+                            border_width=1, border_color=Theme.border)
+        card.grid_columnconfigure(0, weight=1)
+
+        # Cyan accent strip, matching the other overlay cards
+        ctk.CTkFrame(card, height=3, fg_color=Theme.cyan, corner_radius=0,
+                     border_width=0).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            card, text="Select videos",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=Theme.text
+        ).grid(row=1, column=0, padx=24, pady=(18, 0), sticky="w")
+
+        count_lbl = ctk.CTkLabel(
+            card, text=f"{total} of {total} selected",
+            font=ctk.CTkFont(size=11), text_color=Theme.muted
+        )
+        count_lbl.grid(row=2, column=0, padx=24, pady=(2, 0), sticky="w")
+
+        # Scrolling checkbox list — playlists can be hundreds of entries long
+        box = ctk.CTkScrollableFrame(
+            card, width=460, height=300,
+            fg_color=Theme.glass, corner_radius=10
+        )
+        box.grid(row=3, column=0, padx=24, pady=(12, 0), sticky="ew")
+        box.grid_columnconfigure(0, weight=1)
+
+        # Reopening the picker restores the previous ticks (None = all)
+        prev = self.playlist_selection
+        rows = []       # (index, BooleanVar) — index is the playlist position
+        size_lbls = {}  # index -> label showing that video's size
+        sizes = {}      # index -> bytes (0 = unknown)
+        state = {"got": 0, "finished": False}
+
+        for i, entry in enumerate(entries, start=1):
+            title = entry.get("title") or f"Video {i}"
+            short = title if len(title) <= 56 else title[:55] + "\u2026"
+            var = tk.BooleanVar(value=(prev is None or i in prev))
+
+            # A row frame, so the size can sit flush right of the title
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.grid(row=i - 1, column=0, sticky="ew", padx=4, pady=1)
+            row.grid_columnconfigure(0, weight=1)
+
+            ctk.CTkCheckBox(
+                row, text=f"{i}.  {short}", variable=var,
+                font=ctk.CTkFont(size=11), text_color=Theme.text,
+                fg_color=Theme.cyan, hover_color=Theme.purple,
+                border_width=1, border_color=Theme.border,
+                checkbox_width=16, checkbox_height=16, corner_radius=4,
+                command=lambda: refresh()
+            ).grid(row=0, column=0, sticky="w")
+
+            # "…" while its size is being resolved, "?" when YouTube hides it
+            lbl = ctk.CTkLabel(
+                row, text="\u2026", width=66, anchor="e",
+                font=ctk.CTkFont(size=10), text_color=Theme.muted
+            )
+            lbl.grid(row=0, column=1, sticky="e", padx=(8, 6))
+
+            rows.append((i, var))
+            size_lbls[i] = lbl
+
+        def refresh():
+            """Counter plus the running total for whatever is ticked."""
+            if not count_lbl.winfo_exists():
+                # Picker closed → stop our probe instead of hammering YouTube
+                if self._size_token is token:
+                    self._size_token = None
+                return
+            picked = [i for i, v in rows if v.get()]
+            known = [sizes[i] for i in picked if sizes.get(i)]
+            text = f"{len(picked)} of {total} selected"
+            if known:
+                text += f"  \u00b7  ~{_fmt_size(sum(known))}"
+                missing = len(picked) - len(known)
+                if missing:
+                    text += f" + {missing} unknown"
+            if not state["finished"]:
+                text += f"   \u00b7  sizes {state['got']}/{total}"
+            count_lbl.configure(text=text)
+
+        def apply_sizes(batch):
+            """Fold a batch of resolved sizes into the labels and the total."""
+            for i, nbytes in batch.items():
+                sizes[i] = nbytes
+                lbl = size_lbls.get(i)
+                if lbl is not None and lbl.winfo_exists():
+                    lbl.configure(text=_fmt_size(nbytes))
+            state["got"] += len(batch)
+            refresh()
+
+        def sizes_done():
+            state["finished"] = True
+            refresh()
+
+        # Sizes depend on the quality, so probe with the format in use
+        token = object()  # identifies this picker's probe
+        self._probe_sizes(entries, self._format_for(self.q_menu.get()),
+                          apply_sizes, sizes_done, token)
+        refresh()
+
+        def set_all(value):
+            for _, v in rows:
+                v.set(value)
+            refresh()
+
+        def confirm():
+            chosen = {i for i, v in rows if v.get()}
+            if not chosen:
+                messagebox.showwarning("Nothing selected",
+                                       "Tick at least one video.")
+                return
+            # Everything ticked → behave exactly like "Download all"
+            self.playlist_selection = None if len(chosen) == total else chosen
+            self.app._close_overlay()
+            self._start_download(self.q_menu.get(),
+                                 only=self.playlist_selection)
+
+        # Footer: bulk toggles on the left, actions on the right
+        foot = ctk.CTkFrame(card, fg_color="transparent")
+        foot.grid(row=4, column=0, padx=24, pady=(14, 18), sticky="ew")
+        foot.grid_columnconfigure(2, weight=1)
+
+        for col, (text, value) in enumerate((("All", True), ("None", False))):
+            ctk.CTkButton(
+                foot, text=text, width=60, height=30,
+                fg_color=Theme.glass, hover_color=Theme.cyan,
+                text_color=Theme.text, corner_radius=8,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=lambda v=value: set_all(v)
+            ).grid(row=0, column=col, padx=(0, 8))
+
+        ctk.CTkButton(
+            foot, text="Cancel", width=90, height=32,
+            fg_color="transparent", hover_color=Theme.glass,
+            text_color=Theme.muted, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            command=self.app._close_overlay
+        ).grid(row=0, column=3, padx=(0, 8))
+
+        ctk.CTkButton(
+            foot, text="Download selected", width=150, height=32,
+            fg_color=Theme.cyan, hover_color=Theme.purple,
+            text_color="#000000", corner_radius=8,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=confirm
+        ).grid(row=0, column=4)
+
+        return card
+
+    def _probe_sizes(self, entries, fmt, on_batch, on_done, token):
+        """Resolve per-video sizes in the background (YouTube gives none).
+
+        A playlist page carries no file sizes at all, so every entry costs a
+        full extraction (~1-2s). Four workers keep a 50-video list near 20s
+        without looking like a burst to YouTube. Results are cached per
+        (url, quality), so reopening the picker is instant; a superseded
+        probe (picker closed, new link analysed) drops its results instead of
+        poking widgets that no longer exist.
+        """
+        self._size_token = token  # supersedes any probe still running
+
+        cached, todo = {}, []
+        for i, entry in enumerate(entries, start=1):
+            url = entry.get("url") or ""
+            key = (url, fmt)
+            if key in self._size_cache:
+                cached[i] = self._size_cache[key]
+            else:
+                todo.append((i, url))
+
+        if cached:
+            on_batch(cached)
+        if not todo:
+            on_done()
+            return
+
+        def worker():
+            from concurrent.futures import (ThreadPoolExecutor, wait,
+                                            FIRST_COMPLETED)
+            # Only 4 extractions are ever in flight, and the next one is
+            # queued only when a slot frees up — closing the picker therefore
+            # stops a 500-entry list after ~4 more requests instead of
+            # grinding through all of them.
+            pending, nxt = {}, 0
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                while nxt < len(todo) or pending:
+                    while nxt < len(todo) and len(pending) < 4:
+                        i, url = todo[nxt]
+                        nxt += 1
+                        pending[pool.submit(
+                            self.engine.estimate_size, url, fmt)] = (i, url)
+                    if self._size_token is not token:
+                        return  # picker closed or a newer probe took over
+                    finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in finished:
+                        i, url = pending.pop(fut)
+                        try:
+                            size = fut.result()
+                        except Exception:
+                            size = 0
+                        self._size_cache[(url, fmt)] = size
+                        # Default arg: the loop variable moves on
+                        self.after(0, lambda b={i: size}: on_batch(b))
+            if self._size_token is token:
+                self.after(0, on_done)
+
+        _thread(worker)
 
     def _load_thumb(self, url):
         try:
@@ -700,23 +1342,54 @@ class DownloadTab(ctk.CTkFrame):
     # ─── Download ────────────────────────────────────────────────
 
     def _download(self):
+        """Download button → whole list for a playlist, else one video."""
         q = self.q_menu.get()
         if not q or q == "Select":
             messagebox.showwarning("Hold on", "Pick a quality first.")
             return
+        self._start_download(q)
 
-        fmt = "audio_only" if q == "Audio Only (MP3)" else (
-            f"bestvideo[height<={q.split('p')[0]}]+bestaudio/best[height<={q.split('p')[0]}]"
-            if q.split("p")[0].isdigit() else "bestvideo+bestaudio/best"
-        )
-
+    def _start_download(self, q, only=None):
+        """Kick off a worker thread; only = playlist indices from the selector."""
+        fmt = self._format_for(q)
+        self._cancel_evt.clear()
         self.btn_dl.configure(state="disabled", text="...")
+        self.btn_select.configure(state="disabled")
+        self.chk_playlist.configure(state="disabled")
+        self.sub_menu.configure(state="disabled")
+        self.btn_cancel.configure(state="normal", text="Cancel")
+        self.btn_cancel.grid()
         self._show_progress()
         self.prog.set(0)
         self.prog_txt.configure(text="starting ...")
-        _thread(lambda: self._run_dl(fmt, q))
+        subs = self._chosen_subs()
+        if self._playlist_mode():
+            _thread(lambda: self._run_playlist(fmt, q, only, subs))
+        else:
+            _thread(lambda: self._run_dl(fmt, q, subs))
 
-    def _run_dl(self, fmt, label):
+    def _cancel_download(self):
+        """Ask the worker to stop — it aborts the transfer in flight."""
+        self._cancel_evt.set()
+        self.btn_cancel.configure(state="disabled", text="stopping\u2026")
+        self.prog_txt.configure(text="cancelling \u2026")
+
+    @staticmethod
+    def _format_for(q):
+        """Map a quality-menu label to a yt-dlp format string.
+
+        Handles both shapes the menu produces: "1080p (~120 MB)" from a video
+        card and the bare "1080p" buckets offered on a playlist card.
+        """
+        if q == "Audio Only (MP3)":
+            return "audio_only"
+        height = q.split("p")[0]
+        if height.isdigit():
+            return (f"bestvideo[height<={height}]+bestaudio/"
+                    f"best[height<={height}]")
+        return "bestvideo+bestaudio/best"
+
+    def _run_dl(self, fmt, label, subs=None):
         def tick(p):
             self.after(0, lambda: self.prog.set(p / 100))
             self.after(0, lambda: self.prog_txt.configure(text=f"{p:.1f}%"))
@@ -726,11 +1399,17 @@ class DownloadTab(ctk.CTkFrame):
         os.makedirs(dl_path, exist_ok=True)
         res = self.engine.download(
             self.current_url, format_id=fmt,
-            progress_callback=tick, download_path=dl_path
+            progress_callback=tick, download_path=dl_path,
+            should_cancel=self._cancel_evt.is_set, subs=subs
         )
         self.after(0, lambda: self._on_dl(res, label, dl_path))
 
     def _on_dl(self, res, label, dl_path):
+        if res.get("status") == "cancelled":
+            self._idle()
+            self.prog_txt.configure(text="cancelled \u2715")
+            return
+
         if "error" in res:
             self.prog_txt.configure(text="failed")
             messagebox.showerror("Error", res["error"])
@@ -747,6 +1426,61 @@ class DownloadTab(ctk.CTkFrame):
         self.prog_txt.configure(text="done \u2713")
         # Same completion card as the original: Play / Open Folder / Close
         self.app._show_done_popup(title, filepath, label)
+
+    def _run_playlist(self, fmt, label, only=None, subs=None):
+        """Download every entry in the playlist, one video at a time."""
+        def item(i, total, title):
+            short = title if len(title) <= 60 else title[:59] + "\u2026"
+            self.after(0, lambda: self.prog_txt.configure(
+                text=f"{i}/{total}  \u2022  {short}"))
+            self.after(0, lambda: self.prog.set(0))
+
+        def tick(p):
+            self.after(0, lambda: self.prog.set(p / 100))
+
+        dl_path = self.app.download_folder
+        os.makedirs(dl_path, exist_ok=True)
+        res = self.engine.download_playlist(
+            self.current_url, format_id=fmt,
+            on_item=item, progress_callback=tick, download_path=dl_path,
+            only=only, should_cancel=self._cancel_evt.is_set, subs=subs
+        )
+        self.after(0, lambda: self._on_playlist_dl(res, label, dl_path))
+
+    def _on_playlist_dl(self, res, label, dl_path):
+        if "error" in res:
+            self.prog_txt.configure(text="failed")
+            messagebox.showerror("Error", res["error"])
+            self._idle()
+            return
+
+        # One history row per video so History stays a per-file record
+        for entry in res["downloaded"]:
+            self.tracker.add(title=entry["title"], url=entry["url"],
+                             quality=label, filename="", filepath=dl_path)
+
+        done = len(res["downloaded"])
+        total = res["total"]
+
+        # Cancel stops mid-list: keep what finished, skip the "all done" card
+        if res.get("cancelled"):
+            self._idle()
+            self.prog_txt.configure(text=f"cancelled \u2715  {done}/{total}")
+            return
+
+        self._idle()
+        self.prog_txt.configure(text=f"done \u2713  {done}/{total}")
+        # Folder (not a file) → the card drops its Play button by itself
+        self.app._show_done_popup(
+            f"{self.info.get('title', 'Playlist')}  \u2014  {done}/{total} videos",
+            dl_path, label
+        )
+        if res["failed"]:
+            names = "\n".join(f"\u2022 {f['title']}" for f in res["failed"][:10])
+            messagebox.showwarning(
+                "Some videos failed",
+                f"{len(res['failed'])} of {total} could not be downloaded:\n\n{names}"
+            )
 
     def _latest(self, d):
         """Newest finished file in d — never a temp/partial of any tab.

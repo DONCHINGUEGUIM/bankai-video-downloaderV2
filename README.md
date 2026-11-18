@@ -12,6 +12,16 @@ YouTube downloader with a modern GUI and multi-tab support. Works on Windows, Li
 - **Independent progress** — each tab tracks its own download
 - **Close tabs** — "x" to close any tab
 - **Shared history** — all downloads tracked in one history
+- **Playlists** — paste a playlist link and download every video in it, one
+  after another; on a video that sits inside a playlist, tick the checkbox to
+  fetch the whole list instead
+- **Pick videos** — "Select…" on a playlist card opens a checkbox list with
+  each video's size and a running total for your selection
+- **Cancel** — stop a running download at any time, mid-transfer included;
+  finished videos stay on disk
+- **Subtitles** — pick a caption language (or "All available") and it is
+  embedded in the video as a soft track, with the `.srt` kept next to it;
+  MP3 downloads keep the `.srt` on its own
 - **Choose save folder** — "SAVE TO" row with a Browse… picker, shared across all tabs and remembered between launches
 - Download YouTube videos in multiple qualities
 - Extract audio as MP3
